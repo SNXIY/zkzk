@@ -1,0 +1,106 @@
+# Enterprise middleware for knowledge async pipeline: MinIO + Kafka (KRaft).
+# Usage:
+#   docker compose -f docker-compose.middleware.yml up -d
+#   docker compose -f docker-compose.middleware.yml ps
+#   docker compose -f docker-compose.middleware.yml down
+#
+# Host endpoints (nanobot on the host machine):
+#   MinIO S3 API : http://127.0.0.1:9000  (console http://127.0.0.1:9001)
+#   Kafka        : 127.0.0.1:29092
+#
+# Note: Official minio/minio and minio/mc Hub images were removed (source-only).
+# We use coollabsio/minio community builds (includes `mc` for bucket init).
+
+services:
+  minio:
+    image: coollabsio/minio:latest
+    container_name: nanobot-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      # Browser direct upload (presigned PUT/multipart from WebUI origin).
+      MINIO_API_CORS_ALLOW_ORIGIN: "*"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - nanobot_minio_data:/data
+    healthcheck:
+      # coollabsio image may not ship curl; mc + alias against local API is enough.
+      test:
+        [
+          "CMD-SHELL",
+          "mc alias set local http://127.0.0.1:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD >/dev/null 2>&1 && mc ready local",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  minio-init:
+    image: coollabsio/minio:latest
+    container_name: nanobot-minio-init
+    depends_on:
+      minio:
+        condition: service_started
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+          mc alias set local http://minio:9000 minioadmin minioadmin && break
+          sleep 2
+        done
+        mc mb -p local/nanobot-knowledge || true
+        mc anonymous set none local/nanobot-knowledge || true
+        cat >/tmp/cors.json <<'EOF'
+        {
+          "CORSRules": [
+            {
+              "AllowedOrigins": ["*"],
+              "AllowedMethods": ["GET", "PUT", "POST", "HEAD", "DELETE"],
+              "AllowedHeaders": ["*"],
+              "ExposeHeaders": ["ETag", "etag", "x-amz-request-id"],
+              "MaxAgeSeconds": 3600
+            }
+          ]
+        }
+        EOF
+        mc cors set /tmp/cors.json local/nanobot-knowledge || true
+        echo "minio bucket ready: nanobot-knowledge"
+    restart: "no"
+
+  kafka:
+    image: apache/kafka:3.8.1
+    container_name: nanobot-kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "29092:29092"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  nanobot_minio_data:
